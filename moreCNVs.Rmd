@@ -1,0 +1,756 @@
+---
+title: "St. Jude OS data CNV analysis"
+author: "Matt Cannon"
+date: 06-03-2022
+output:
+    html_document:
+        code_folding: hide
+        toc: yes
+        toc_depth: 3
+        toc_float:
+            collapsed: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    cache = TRUE,
+    fig.height = 10,
+    fig.width = 20,
+    dpi = 300)
+```
+
+# St. Jude OS data CNV analysis
+
+## Goals:
+
+We want to characterize the CNV data from St. Jude OS samples in order to
+determine if the CNVs are consistent across samples within a patient. This will
+tell us if these tumors are genomically stable or if there are ongoing
+rearrangements. We also want to determine if there are sub-clones within a
+single patient which would be revealed by distinct CNV patterns within a patient.
+
+## Samples:
+
+For this analysis we got access to many St. Jude OS samples. We also included
+our single-cell sequencing data which we treated as bulk for the purposes of
+these analyses.
+
+# Workflow
+
+## Load libraries
+```{r libraries, cache=FALSE, eval=TRUE}
+library(tidyverse)
+theme_set(theme_bw())
+theme_update(plot.title = element_text(hjust = 0.5))
+library(gt)
+```
+
+## Make up directory structure
+```{bash mkdirs, eval=TRUE}
+for directoryName in \
+  misc \
+  slurmOut \
+  input\split \
+  output \
+  output/aligned \
+  output/figures \
+  output/counts \
+  output/varscan/copynumber/ \
+  output/vcfs \
+  output/vcfs/realignSummary \
+  output/vcfs/p53Char \
+  output/vcfs/p53Char/clinVar
+do
+  if [ ! -d ${directoryName} ]
+  then
+    mkdir -p ${directoryName}
+  fi 
+done
+```
+
+## Prepare files that contain links to DNAnexus data
+Had to do this by hand due to the links expiring after 24 hours
+
+We had a lot of trouble downloading large bam files from DNAnexus. The downloads
+frequently got interupted. To get around this, I split the files in DNAnexus
+into smaller chunks to make interuptions less likely. I also wrote the code
+below to automatically resume the downloads if the download was interupted. I
+had the script check the md5sums to be sure that the file wasn't corrupted
+during download. The original file is then re-generated using cat and md5sum
+checked again.
+
+Don't forget to dos2unix the .txt files before running!
+
+```{bash prepDl, eval=FALSE}
+perl ../scripts/prepDownloadFile.pl \
+  --linkFile misc/DNAnexus_export_urls-20210926-103118.txt \
+  --md5File misc/allMd5.txt \
+    > misc/batch1DownloadFile.txt
+
+perl ../scripts/prepDownloadFile.pl \
+  --linkFile misc/DNAnexus_export_urls-20210927-085055.txt \
+  --md5File misc/allMd5.txt \
+    > misc/batch2DownloadFile.txt
+
+perl ../scripts/prepDownloadFile.pl \
+  --linkFile misc/DNAnexus_export_urls-20210928-082401.txt \
+  --md5File misc/allMd5.txt \
+    > misc/batch3DownloadFile.txt
+
+perl ../scripts/prepDownloadFile.pl \
+  --linkFile misc/DNAnexus_export_urls-20210929-083226.txt \
+  --md5File misc/allMd5.txt \
+    > misc/batch4DownloadFile.txt
+
+perl ../scripts/prepDownloadFile.pl \
+  --linkFile misc/DNAnexus_export_urls-20210930-084226.txt \
+  --md5File misc/allMd5.txt \
+    > misc/batch5DownloadFile.txt
+    
+perl ../scripts/prepDownloadFile.pl \
+  --linkFile misc/DNAnexus_export_urls-20211001-084849.txt \
+  --md5File misc/allMd5.txt \
+    > misc/batch6DownloadFile.txt
+```
+
+## Download split files from DNA nexus
+I had to run these one by one manually due to how the data are organized
+```{bash download, eval=FALSE}
+sbatch sbatchCmds/forceDownload_1.sh
+sbatch sbatchCmds/forceDownload_2.sh
+sbatch sbatchCmds/forceDownload_3.sh
+sbatch sbatchCmds/forceDownload_4.sh
+sbatch sbatchCmds/forceDownload_5.sh
+sbatch sbatchCmds/forceDownload_6.sh
+```
+
+## Downloaded the md5 data for the raw bam files
+```{bash getRawMd5s, eval=FALSE}
+cat misc/rawMd5s/rawBamMd5_md5sum_job-G5FQ* > misc/rawBamMd5s.txt
+```
+
+## Recombine the split files and check md5sums
+```{bash recombineSplit, eval=FALSE}
+sbatch sbatchCmds/catSplitFiles.sh
+```
+
+## Make up symbolic links to previously analyzed data so we can analyze those as well
+```{bash symLinks, eval=FALSE}
+for original in S0113 S0114 S0115 S0116 S0126 S0127 S0128
+do
+    ln -s \
+        /home/gdrobertslab/lab/Counts/${original}/possorted_bam.bam \
+        input/${original}.bam
+done
+
+# Some of the samples were already in the input folder and don't need symLinks
+for original in \
+        SJOS046149_R1 SJOS046149_R2 SJOS046149_X1 SJOS031478_D1 \
+        SJOS031478_D2 SJOS031478_D3
+do
+    ln -s \
+        ~/analyses/roberts/stjude/rawData/${original}.WholeGenome.bam \
+        input/${original}.WholeGenome.bam
+done
+```
+
+## Make up a list of all chromosomes in the hg38 genome
+Kicked out the unknown and random chromosomes
+```{bash makeChrList, eval=TRUE}
+cat /reference/homo_sapiens/hg38/ucsc_assembly/illumina_download/Sequence/WholeGenomeFasta/genome.fa.fai | \
+  grep -v "chrUn\|random\|EBV" \
+    > misc/chrList.txt
+```
+
+## Realign the bam files using a mixed human/mouse reference
+```{bash realign, eval=FALSE}
+if [ ! -d /gpfs0/scratch/mvc002/roberts/stjude/realigned ]
+then
+    mkdir -p /gpfs0/scratch/mvc002/roberts/stjude/realigned
+fi
+
+sbatch sbatchCmds/realign.sh
+```
+
+## Call CNVs using varscan
+```{bash callCNVnumber, eval=FALSE}
+sbatch sbatchCmds/mpileupVarscan.sh
+```
+
+## Refine CNV calls using varscan copycaller
+```{bash callCNVcopycaller, eval=FALSE}
+sbatch sbatchCmds/varScanCopycaller.sh
+```
+
+### Plot the distribution of CNVs found by copynumber
+```{r plotCNVs, eval=TRUE}
+pdf(file = "output/figures/CNVdistribution_copynumber.pdf")
+for (sample_name in list.dirs(path = "output/varscan/copynumber",
+                              full.names = FALSE,
+                              recursive = FALSE)) {
+    print(read_tsv(list.files(path = paste("output/varscan/copynumber/",
+                                           sample_name,
+                                           sep = ""),
+                             pattern = "*.copynumber",
+                             full.names = TRUE),
+                   show_col_types = FALSE) %>%
+        sample_n(1000000) %>%
+        select(log2_ratio) %>%
+        mutate(ratio = 2^log2_ratio) %>%
+        ggplot(aes(x = ratio)) +
+        geom_histogram(bins = 300) +
+        geom_vline(xintercept = 1) +
+        scale_x_log10() +
+        geom_vline(xintercept = 2) +
+        geom_vline(xintercept = 0.5) +
+        ggtitle(sample_name))
+}
+dev.off()
+```
+
+## Calculate the distance between samples based on CNVs
+This approach has the issue that normalization isn't perfect across the samples
+due to the extensive number of genomic changes. This artificially increases the
+distance between similar samples. This likely will not be used in the paper.
+```{bash varscanMatrix, eval=FALSE}
+perl scripts/varscanToMatrix.pl \
+    -v \
+    --fileList "output/varscan/copycaller/S*/*chr*.txt" \
+        > output/varscan/varscan_distMatrix.txt
+
+perl scripts/varscanToMatrix_threshhold.pl \
+    -v \
+    --fileList "output/varscan/copycaller/S011*/*chr*.txt" \
+        > output/varscan/varscan_distMatrix_threshhold.txt
+```
+
+## Combine the varscan outputs into one file
+```{bash varscanCombine, eval=FALSE}
+sbatch sbatchCmds/combineVarscan.sh
+```
+
+## Make plots of the CNV calls across all the samples
+```{r plotVarscan, eval=TRUE}
+large_bin_size <- 100000
+
+combined_data <- read_tsv("output/varscan/combined_calls.txt",
+                          show_col_types = FALSE) %>%
+    mutate(chr_num = str_remove(chr, "chr") %>%
+                as.numeric()) %>%
+    arrange(chr_num, bin) %>%
+    mutate(order = seq_len(nrow(.)),
+           larger_bin = floor(bin / large_bin_size) * large_bin_size) %>%
+    pivot_longer(cols = c(-chr, -bin, -order, -chr_num, -larger_bin),
+                 names_to = "sample",
+                 values_to = "log_ratio")
+
+patient_key <- data.frame(
+    patient = unique(combined_data$sample) %>%
+        str_remove("_.+") %>%
+        str_replace("S0126", "SJOS030645") %>%
+        str_replace("S0127", "SJOS030645") %>%
+        str_replace("S0128", "SJOS030645") %>%
+        str_replace("S0114", "SJOS031478") %>%
+        str_replace("S0116", "SJOS031478") %>%
+        str_replace("S0113", "SJOS046149") %>%
+        str_replace("S0115", "SJOS046149"),
+    sample_type = unique(combined_data$sample) %>%
+        str_replace("^S0.+", "Xenograft") %>%
+        str_replace(".+_X.+", "Xenograft") %>%
+        str_replace(".+_D.+", "Diagnosis") %>%
+        str_replace(".+_M.+", "Metastasis") %>%
+        str_replace(".+_R.+", "Relapse"),
+    sample = unique(combined_data$sample))
+
+combined_data <- full_join(combined_data, patient_key)
+
+chr_cols <- sample(rainbow(length(unique(combined_data$chr))),
+                   length(unique(combined_data$chr)),
+                   replace = FALSE)
+
+for (patient_name in unique(patient_key$patient)) {
+    plot_name <- combined_data %>%
+        filter(patient == patient_name) %>%
+        group_by(chr, sample, larger_bin) %>%
+        summarize(log_ratio = median(log_ratio),
+                order = min(order),
+                .groups = "drop") %>%
+        ggplot(aes(x = order,
+                    y = log_ratio,
+                    color = chr)) +
+        geom_hline(yintercept = 0, color = "black") +
+        geom_point(alpha = 0.5,
+                    size = 0.5) +
+        scale_color_manual(values = chr_cols) +
+        labs(y = "Copy number log ratio",
+             x = "") +
+        facet_wrap(~ sample, ncol = 1)
+
+    ggsave(paste0("output/figures/varscan",
+                 patient_name,
+                 ".png"),
+           plot = plot_name,
+           width = 20,
+           height = 8)
+}
+
+## Take a look at regions commonly amplified/deleted across samples
+unique_clones <- c("SJOS001101_M4",
+                   "SJOS001111_M1",
+                   "SJOS001116_X2",
+                   "SJOS001121_X2",
+                   "SJOS001126_X1",
+                   "SJOS013768_X1",
+                   "SJOS016016_X1",
+                   "SJOS030101_R1",
+                   "SJOS030645_D2",
+                   "SJOS031478_D3",
+                   "SJOS046149_R2",
+                   "SJOS001105_R1")
+
+combined_data %>%
+    filter(sample %in% unique_clones) %>%
+    group_by(chr, bin) %>%
+    summarize(mean_ratio = median(log_ratio),
+              order = min(order),
+              .groups = "drop") %>%
+    ggplot(aes(x = bin,
+               y = mean_ratio,
+               color = chr)) +
+    geom_hline(yintercept = 0, color = "black") +
+    geom_point(alpha = 0.5,
+               size = 0.5) +
+    labs(x = "",
+         y = "Mean copy number ratio") +
+    facet_wrap(~ chr, scales = "free_x") +
+    theme(legend.position = "none")
+
+ggsave("output/figures/clonal_mean_CNV.png",
+       width = 15,
+       height = 10)
+
+high_chr3 <- combined_data %>%
+    filter(sample %in% unique_clones) %>%
+    group_by(chr, bin) %>%
+    summarize(mean_ratio = median(log_ratio),
+              order = min(order),
+              .groups = "drop") %>%
+    filter(chr == "chr3" & mean_ratio < -0.5)
+```
+
+## Look at correlation of CNVs between samples
+```{r CNVcorr, eval=TRUE}
+cnv_cor <- read_tsv("output/varscan/combined_calls.txt",
+                     col_names = TRUE,
+                     show_col_types = FALSE) %>%
+    mutate(chr_bin = paste(chr, bin, sep = "_"), .keep = "unused") %>%
+    column_to_rownames("chr_bin") %>%
+    cor()
+
+patient_key <- data.frame(patient = rownames(cnv_cor) %>%
+                                str_remove("_.+") %>%
+                                str_replace("S0126", "SJOS030645") %>%
+                                str_replace("S0127", "SJOS030645") %>%
+                                str_replace("S0128", "SJOS030645") %>%
+                                str_replace("S0114", "SJOS031478") %>%
+                                str_replace("S0116", "SJOS031478") %>%
+                                str_replace("S0113", "SJOS046149") %>%
+                                str_replace("S0115", "SJOS046149"),
+                          sample_type = rownames(cnv_cor) %>%
+                                str_replace("^S0.+", "Xenograft") %>%
+                                str_replace(".+_X.+", "Xenograft") %>%
+                                str_replace(".+_D.+", "Diagnosis") %>%
+                                str_replace(".+_M.+", "Metastasis") %>%
+                                str_replace(".+_R.+", "Relapse"),
+                          sample_2 = rownames(cnv_cor)) %>%
+    column_to_rownames("sample_2")
+
+long_cor <-
+    cnv_cor %>%
+    as.data.frame() %>%
+    rownames_to_column("sample_1") %>%
+    pivot_longer(-sample_1,
+                 names_to = "sample_2",
+                 values_to = "cor") %>%
+    left_join(patient_key %>%
+                rownames_to_column("sample_1") %>%
+                rename(patient_1 = patient) %>%
+                select(-sample_type)) %>%
+    left_join(patient_key %>%
+                rownames_to_column("sample_2") %>%
+                rename(patient_2 = patient) %>%
+                select(-sample_type)) %>%
+    mutate(within = patient_1 == patient_2,
+           sample_1 = fct_reorder(sample_1, patient_1),
+           sample_2 = fct_reorder(sample_2, patient_2)) %>%
+    filter(sample_1 != sample_2) %>%
+    arrange(patient_1)
+
+## Try to id clones
+clone_table <- tibble(sample_1 = character(),
+                      clone_num = factor())
+claimed_list <- character()
+cor_cutoff <- 0.4
+clone_num <- 1
+
+for (sample_name in rownames(cnv_cor)) {
+    if (!sample_name %in% claimed_list) {
+        new_claimed <-
+            long_cor %>%
+            filter(sample_1 == sample_name &
+                    cor >= cor_cutoff &
+                    within == TRUE) %>%
+            select(sample_2, cor) %>%
+            mutate(clone_num = as.factor(clone_num)) %>%
+            bind_rows(tibble(clone_num = as.factor(clone_num),
+                             sample_2 = sample_name,
+                             cor = 1))
+        clone_table <-
+            rbind(clone_table, new_claimed)
+        claimed_list <- c(claimed_list, sample_name, new_claimed$sample_2)
+        clone_num <- clone_num + 1
+    }
+}
+
+
+clone_table <-
+    clone_table %>%
+    group_by(sample_2) %>%
+    arrange(cor * -1, .by_group = TRUE) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    select(-cor)
+
+long_cor <- full_join(long_cor, clone_table, by = "sample_2")
+
+# Mean within patient correlation
+long_cor %>%
+    filter(within == TRUE) %>%
+    pull(cor) %>%
+    summary()
+
+# # Mean correlation within a clone
+# long_cor %>%
+#     select(sample_2, patient_2, cor, clone_num) %>%
+#     group_by(patient_2, clone_num) %>%
+#     summarize(cor = mean(cor)) %>%
+#     pull(cor) %>%
+#     summary()
+
+# Get number of patients with >1 clone
+long_cor %>%
+    select(patient_2, clone_num) %>%
+    arrange(patient_2) %>%
+    distinct() %>%
+    pull(patient_2) %>%
+    table()
+
+# Mean within clone correlation
+long_cor %>%
+    full_join(clone_table %>%
+                rename(sample_1 = sample_2,
+                       clone_2 = clone_num)) %>%
+    filter(clone_num == clone_2) %>%
+    pull(cor) %>%
+    summary()
+
+# Mean correlatin within a patient between divergent clones
+long_cor %>%
+    full_join(clone_table %>%
+                rename(sample_1 = sample_2,
+                       clone_2 = clone_num)) %>%
+    filter(patient_1 == patient_2 &
+           clone_num != clone_2) %>%
+    pull(cor) %>%
+    summary()
+
+# Mean correlation between patients
+long_cor %>%
+    full_join(clone_table %>%
+                rename(sample_1 = sample_2,
+                       clone_2 = clone_num)) %>%
+    filter(patient_1 != patient_2) %>%
+    pull(cor) %>%
+    summary()
+
+# Correlation between xenografts and original samples within a single clone and patient
+long_cor %>%
+    full_join(clone_table %>%
+                rename(sample_1 = sample_2,
+                       clone_2 = clone_num)) %>%
+    left_join(patient_key %>%
+                rownames_to_column("sample_1") %>%
+                rename(type_1 = sample_type) %>%
+                select(-patient)) %>%
+    left_join(patient_key %>%
+                rownames_to_column("sample_2") %>%
+                rename(type_2 = sample_type) %>%
+                select(-patient)) %>%
+    filter(patient_1 == patient_2 &
+           clone_num == clone_2 &
+           type_1 == "Xenograft" &
+           type_2 != "Xenograft") %>%
+    select(-within, -patient_1, -patient_2) %>%
+    pull(cor) %>%
+    summary()
+
+ggplot(long_cor, aes(x = cor)) +
+    geom_histogram(bins = 200) +
+    facet_wrap(~ within, ncol = 1)
+
+# correlation of about 0.4 seems to be the upper bound of non-related samples
+
+n_clones <- max(as.numeric(long_cor$clone_num))
+
+text_col <-
+    long_cor %>%
+    full_join(tibble(clone_num = seq_len(n_clones) %>%
+                        as.factor(),
+                    text_col = rainbow(n = n_clones) %>%
+                        sample(size = n_clones))) %>%
+    mutate(group = paste(patient_2, sample_2)) %>%
+    select(group, text_col) %>%
+    distinct() %>%
+    arrange(group) %>%
+    pull(text_col)
+
+ggplot(long_cor, aes(x = paste(patient_1, sample_1),
+                     y = paste(patient_2, sample_2),
+                     fill = cor)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "blue",
+                         mid = "white",
+                         high = "red",
+                         midpoint = 0.5) +
+    theme(axis.text.y = element_text(colour = text_col))
+
+
+patient_key <- patient_key %>%
+    rownames_to_column("sample_2") %>%
+    full_join(clone_table) %>%
+    column_to_rownames("sample_2") %>%
+    rename(clone = clone_num,
+           `sample type` = sample_type) %>%
+    relocate(`sample type`, .after = last_col())# %>%
+#    select(-`sample type`)
+
+col_patient <- list(patient = c("#a6cee3",
+                                "#1f78b4",
+                                "#b2df8a",
+                                "#33a02c",
+                                "#fb9a99",
+                                "#e31a1c",
+                                "#fdbf6f",
+                                "#ff7f00",
+                                "#cab2d6",
+                                "#6a3d9a",
+                                "#ffff99",
+                                "#b15928"),
+                    clone = c("#96FF00",
+                              "#00FFD2",
+                              "#FF00B4",
+                              "#2b754e",
+                              "#3CFF00",
+                              "#FF5A00",
+                              "#F000FF",
+                              "#9600FF",
+                              "#3C00FF",
+                              "#F0FF00",
+                              "#FFB400",
+                              "#0078FF",
+                              "#001EFF",
+                              "#00FF1E",
+                              "#FF0000",
+                              "#00D2FF",
+                              "#FF005A"),
+                    `sample type` = c("#a6cee3",
+                                    "#1f78b4",
+                                    "#b2df8a",
+                                    "#33a02c"))
+
+names(col_patient$patient) <- patient_key$patient %>%
+    as.factor() %>%
+    levels()
+
+names(col_patient$`sample type`) <- patient_key$`sample type` %>%
+    as_factor() %>%
+    levels()
+
+names(col_patient$clone) <- levels(clone_table$clone_num)
+
+png("output/figures/cnv_correlation_heatmap.png",
+    width = 3500,
+    height = 3000,
+    res = 300)
+pheatmap::pheatmap(cnv_cor,
+                   annotation_row = patient_key,
+                   annotation_col = patient_key,
+                   annotation_colors = col_patient)
+dev.off()
+
+```
+
+# SNP calling
+
+## Call snps using bcftools mpileup and filter SNPs
+Filter out indels and SNPs with qual < 20 and depth < 20
+```{bash snpCalling, eval=FALSE}
+# Make up a list of chromosomes to analyze for use by parallel
+grep "^>" \
+    /reference/homo_sapiens/hg38/ucsc_assembly/illumina_download/Sequence/WholeGenomeFasta/genome.fa \
+    | grep -v "random\|chrUn\|chrEBV" \
+    | perl -pe 's/>//' \
+        > misc/chrList.txt
+
+sbatch sbatchCmds/callVariants.sh
+```
+
+```{bash indexSnpCalling, eval=FALSE}
+sbatch sbatchCmds/indexVcfs.sh
+```
+
+## Calculate distance between samples based on SNP calls
+```{bash snpDist, eval=FALSE}
+module load GCC/9.3.0 \
+            GCCcore/9.3.0 \
+            BCFtools/1.11 \
+            SAMtools/1.15
+
+perl scripts/vcfToMatrix_parallel.pl \
+    --fileList "output/vcfs/S*vcf.gz" \
+    --threads 20 \
+        > output/vcfs/snpDistanceMatrix.txt
+```
+
+## Check P53 for mutations using SnpEff
+```{bash p53, eval=FALSE}
+sbatch sbatchCmds/TP53MutChar.sh
+
+wget https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar_20220416.vcf.gz
+mv clinvar_20220416.vcf.gz misc/
+zcat misc/clinvar_20220416.vcf.gz \
+    | awk '$1 ~ /^#/ || \
+           $1 == 17 && \
+           $2 >= 7600000 && \
+           $2 <= 7690000 \
+           {print}' \
+    | perl -pe 's/^17/chr17/' \
+    | gzip \
+    > misc/clinvar_TP53.vcf.gz
+```
+
+## Merge clinvar data with TP53Muts.txt
+```{bash clinvarCombine, eval=FALSE}
+combineClinvar.sh
+```
+
+```{r germlineP53, eval=TRUE}
+filter_list <- function(x) {
+    str_split(x, ",") %>%
+    unlist() %>%
+    str_subset("TP53") %>%
+    str_c(collapse = ",")
+}
+
+file_list <- list.files("output/vcfs/p53Char/clinVar",
+                        pattern = ".+_G.+",
+                        full.names = TRUE)
+
+combined_data <- tibble(sample = character())
+
+for (file_name in file_list) {
+    combined_data <-
+        read_tsv(file_name,
+                 col_names = TRUE,
+                 col_types = cols(.default = "c")) %>%
+        filter(grepl("TP53", ANN)) %>%
+        rowwise() %>%
+        mutate(ANN = filter_list(ANN),
+               sample = str_match(file_name, ".+/(.+).txt")[2]) %>%
+        filter(ANN != "") %>%
+        bind_rows(combined_data) %>%
+        relocate(sample, CLNSIG, ANN)
+}
+
+write_tsv(combined_data,
+          file = "output/vcfs/p53Char/p53Char_combined_germline.txt")
+```
+
+```{bash p53Combine, eval=TRUE}
+perl scripts/cmpVarscanCalls.pl \
+    --binSize 100 \
+    --inputFiles "output/varscan/copycaller/*/*chr17.txt" \
+        > output/varscan/combined_calls_chr17.txt
+```
+
+## Plot P53 CNV data
+```{r p53Cnv, eval=TRUE}
+P53_loc <- list(min = 7661779,
+                max = 7687538)
+
+combined_data <- read_tsv("output/varscan/combined_calls_chr17.txt",
+                          show_col_types = FALSE) %>%
+    mutate(chr_num = str_remove(chr, "chr") %>%
+                as.numeric()) %>%
+    filter(chr_num == 17 & bin >= 7550000 & bin <= 7800000) %>%
+    arrange(chr_num, bin) %>%
+    pivot_longer(cols = c(-chr, -bin, -chr_num),
+                 names_to = "sample",
+                 values_to = "log_ratio")
+
+patient_key <- data.frame(
+    patient = unique(combined_data$sample) %>%
+        str_remove("_.+") %>%
+        str_replace("S0126", "SJOS030645") %>%
+        str_replace("S0127", "SJOS030645") %>%
+        str_replace("S0128", "SJOS030645") %>%
+        str_replace("S0114", "SJOS031478") %>%
+        str_replace("S0116", "SJOS031478") %>%
+        str_replace("S0113", "SJOS046149") %>%
+        str_replace("S0115", "SJOS046149"),
+    sample_type = unique(combined_data$sample) %>%
+        str_replace("^S0.+", "Xenograft") %>%
+        str_replace(".+_X.+", "Xenograft") %>%
+        str_replace(".+_D.+", "Diagnosis") %>%
+        str_replace(".+_M.+", "Metastasis") %>%
+        str_replace(".+_R.+", "Relapse"),
+    sample = unique(combined_data$sample))
+
+combined_data <- full_join(combined_data, patient_key) %>%
+    mutate(amplification = if_else(log_ratio > 0.5,
+                                   "amplification",
+                                   if_else(log_ratio < -0.5,
+                                           "deletion",
+                                           "normal")))
+
+ggplot(combined_data,
+       aes(x = bin,
+           y  = sample,
+           fill = log_ratio)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#8e0152",
+                         mid = "white",
+                         high = "#276419") +
+    facet_grid(patient ~ .,
+               scales = "free_y",
+               space = "free") +
+    theme(strip.text.y.right = element_text(angle = 0)) +
+    geom_vline(xintercept = P53_loc$min,
+               linetype = "dashed",
+               colour = "red") +
+    geom_vline(xintercept = P53_loc$max,
+               linetype = "dashed",
+               colour = "red") +
+    labs(x = "Chromosome 17 position",
+         y = "",
+         title = "TP53 copy numbers")
+
+ggsave(file = "output/figures/p53Cnv_chr17.png",
+       width = 10,
+       height = 10)
+```
+
+```{r sessionInfo, eval=TRUE, cache=FALSE}
+sessionInfo()
+```
